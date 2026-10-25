@@ -1,0 +1,37 @@
+# Relocatable CMake configuration file for posix_tls package
+@PACKAGE_INIT@
+
+if(NOT TARGET posix_tls::posix_tls)
+    add_library(posix_tls::posix_tls STATIC IMPORTED)
+
+    set_target_properties(posix_tls::posix_tls PROPERTIES
+        IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/lib/libposix_tls.a"
+        INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/include"
+    )
+
+    set(_posix_tls_deps
+        "${PACKAGE_PREFIX_DIR}/lib/libssl.a"
+        "${PACKAGE_PREFIX_DIR}/lib/libcrypto.a"
+    )
+
+    set(_posix_tls_is_qnx "@POSIX_TLS_IS_QNX@")
+    if(_posix_tls_is_qnx OR QNXNTO OR CMAKE_SYSTEM_NAME STREQUAL "QNX")
+        list(APPEND _posix_tls_deps cpp socket m)
+    else()
+        list(APPEND _posix_tls_deps stdc++ pthread ${CMAKE_DL_LIBS} m)
+    endif()
+
+    set_target_properties(posix_tls::posix_tls PROPERTIES
+        IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+        INTERFACE_LINK_LIBRARIES "${_posix_tls_deps}"
+    )
+
+    if((DEFINED CMAKE_CXX_COMPILER_ID AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang") OR
+       (DEFINED CMAKE_C_COMPILER_ID AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+        set_target_properties(posix_tls::posix_tls PROPERTIES
+            INTERFACE_LINK_OPTIONS "-Wl,--exclude-libs,ALL"
+        )
+    endif()
+endif()
+
+check_required_components(posix_tls)
