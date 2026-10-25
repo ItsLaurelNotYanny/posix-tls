@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Linux x86_64 Verification Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential perl python3 openssl
+
+      - name: Cache pinned dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: vendor/sources
+          key: pinned-sources-${{ hashFiles('dependencies.lock.json') }}
+
+      - name: Fetch pinned dependencies
+        run: |
+          python3 scripts/dependencies.py --fetch
+
+      - name: Run full verification gate
+        run: |
+          ./check.sh

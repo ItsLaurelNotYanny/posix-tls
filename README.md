@@ -1,5 +1,9 @@
 # posix-tls
 
+[![CI](https://github.com/ItsLaurelNotYanny/posix-tls/actions/workflows/ci.yml/badge.svg)](https://github.com/ItsLaurelNotYanny/posix-tls/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/ItsLaurelNotYanny/posix-tls)](https://github.com/ItsLaurelNotYanny/posix-tls/releases/latest)
+
 Add TLS 1.2 / 1.3 to any POSIX socket. No dependencies, no symbol conflicts.
 
 Hand `posix-tls` a connected `int fd`; it handles the handshake, certificate checks, and cleanup. It offers a plain C API ([`posix_tls.h`](include/posix_tls/posix_tls.h)) and a C++03 RAII wrapper ([`posix_tls.hpp`](include/posix_tls/posix_tls.hpp)), and bundles OpenSSL 3.5 LTS statically, so it works on old and embedded systems where modern TLS is hard to get.
@@ -50,6 +54,23 @@ Return-code checks are trimmed for brevity. See [full examples](docs/examples.md
 - **Clear `fd` ownership:** if create fails, the `fd` is still yours; once it succeeds, it is closed exactly once on destroy.
 - **Nonblocking-ready:** returns `POSIX_TLS_ERR_WANT_READ` / `WANT_WRITE` for use with `select`, `poll`, `epoll`, `kqueue`, or `QSocketNotifier`.
 
+## Why Not mbedTLS, wolfSSL, or BearSSL?
+
+| Feature / Trade-off | `posix-tls` | mbedTLS 3.x | wolfSSL | BearSSL |
+| :--- | :--- | :--- | :--- | :--- |
+| **Input Boundary** | **Connected `int fd`** (C / C++03 RAII) | Custom I/O callbacks or `net_ctx` | Custom I/O callbacks | Push/pull engine buffers |
+| **Legacy Symbol Safety** | **Hermetic** (zero `.dynsym` symbols) | Different prefix | Different prefix (compat layer clashes) | Different prefix |
+| **License** | **Permissive (MIT + Apache 2.0)** | Permissive (Apache 2.0) | **GPLv2** or commercial license | Permissive (MIT) |
+| **TLS 1.3 Support** | **Full** (via OpenSSL 3.5 LTS) | Full | Full | **No** (TLS 1.2 only) |
+| **Legacy Compatibility** | Strict C++03 / C99, QNX 6.6, Linux | C99, CMake / Python config | C89 / C99 | C99 |
+| **Binary Footprint** | ~2–4 MB (embedded OpenSSL) | ~500 KB–1 MB | ~300 KB–1 MB | **~100–200 KB** |
+
+**Trade-offs in plain English:**
+- Choose **BearSSL** or **wolfSSL** if your hardware has severe memory limits (< 512 KB RAM/ROM) and cannot afford a ~2 MB binary.
+- Choose **mbedTLS** if you are writing a greenfield embedded application and want modular crypto with custom network adapters.
+- Choose **wolfSSL** if you are comfortable with GPLv2 copyleft terms or hold a commercial license.
+- Choose **posix-tls** if you need modern TLS 1.2 / 1.3 on an existing POSIX socket `int fd` in C or C++03, require a **permissive open-source license**, and must **coexist with an older system `libssl.so`** (e.g. on QNX 6.6, BlackBerry 10, or legacy enterprise Linux) without symbol collision crashes.
+
 ## Install
 
 ### 1. Download a prebuilt SDK
@@ -94,6 +115,7 @@ Prefer to build it yourself, or need to cross-compile for QNX / BlackBerry 10? S
 - [Consumer build guide](share/posix_tls/BUILDING.md): linking relocated SDKs
 - [Design notes](docs/design.md): symbol isolation and static linker caveats
 - [`posix_tls_probe` CLI](docs/probe.md): try TLS 1.3 over localhost TCP
+- [Security policy](SECURITY.md): vulnerability reporting and upstream OpenSSL SLA
 - [Changelog](CHANGELOG.md): release history
 
 ## License
