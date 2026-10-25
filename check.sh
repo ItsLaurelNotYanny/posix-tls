@@ -36,7 +36,7 @@ run() {
 }
 # Host gate: public hygiene, pinned dependencies, strict C++03 build, TLS contracts, relocated consumers.
 # QNX ARMv7 cross-compile/link is a separate explicit check: scripts/check-native.sh.
-need git
+[ ! -e .git ] || need git
 need python3
 need cmake
 need bash

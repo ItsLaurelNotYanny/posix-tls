@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <climits>
 #include <iostream>
 #include <string>
 
@@ -261,6 +262,9 @@ int main() {
     unsigned char entropy[16];
     TEST_ASSERT(posix_tls::randomBytes(entropy, sizeof(entropy)) == POSIX_TLS_OK,
                 "posix_tls::randomBytes failed");
+    const size_t over_max = static_cast<size_t>(INT_MAX) + static_cast<size_t>(1);
+    TEST_ASSERT(posix_tls_random_bytes(entropy, over_max) == POSIX_TLS_ERR_INVALID_ARG,
+                "Oversized random_bytes length must fail with INVALID_ARG");
 
     // 2. Fragmented Nonblocking Bidirectional Streaming Test (64-byte chunks over 2048-byte stream)
     std::cout << "[Standalone Consumer] Running fragmented nonblocking bidirectional streaming test..." << std::endl;
@@ -316,6 +320,13 @@ int main() {
     TEST_ASSERT(std::memcmp(send_data, corrupted_data, STREAM_SIZE) != 0, "Altered streaming payload must not match sent data");
 
     posix_tls_shutdown(c_conn);
+    TEST_ASSERT(posix_tls_connect(c_conn, NULL) == POSIX_TLS_ERR_CLOSED,
+                "Post-shutdown connect must return CLOSED");
+    TEST_ASSERT(posix_tls_accept(c_conn) == POSIX_TLS_ERR_CLOSED,
+                "Post-shutdown accept must return CLOSED");
+    size_t post_close_n = 0;
+    TEST_ASSERT(posix_tls_read(c_conn, recv_data, 1, &post_close_n) == POSIX_TLS_ERR_IO_FAILED,
+                "Post-shutdown read must remain IO_FAILED");
     posix_tls_connection_destroy(c_conn);
     pthread_join(sthread, NULL);
     TEST_ASSERT(sarg.success, "Server streaming worker reported failure");

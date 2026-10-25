@@ -8,15 +8,16 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 int posix_tls_random_bytes(unsigned char* buf, size_t len) {
-    if (!buf || len == 0) {
+    if (!buf || len == 0 || len > static_cast<size_t>(INT_MAX)) {
         return POSIX_TLS_ERR_INVALID_ARG;
     }
-    if (RAND_bytes(buf, (int)len) != 1) {
+    if (RAND_bytes(buf, static_cast<int>(len)) != 1) {
         return POSIX_TLS_ERR_ENTROPY_FAILURE;
     }
     return POSIX_TLS_OK;
@@ -101,7 +102,7 @@ int posix_tls_sha256_file(const char* filepath, char* out_hex_65) {
 }
 
 int posix_tls_calculate_cert_fingerprint(const char* cert_pem, size_t cert_len, char* out_hex_65) {
-    if (!cert_pem || cert_len == 0 || !out_hex_65) {
+    if (!cert_pem || cert_len == 0 || cert_len > static_cast<size_t>(INT_MAX) || !out_hex_65) {
         return POSIX_TLS_ERR_INVALID_ARG;
     }
     BIO* bio = BIO_new_mem_buf(cert_pem, static_cast<int>(cert_len));
@@ -211,16 +212,22 @@ int posix_tls_generate_self_signed_cert(char** out_cert_pem,
 
     char* cert_data = NULL;
     long cert_size = BIO_get_mem_data(cert_bio, &cert_data);
-    *out_cert_pem = (char*)malloc(cert_size + 1);
+    if (cert_size <= 0 || !cert_data) {
+        BIO_free(cert_bio);
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return POSIX_TLS_ERR_INTERNAL;
+    }
+    *out_cert_pem = (char*)malloc(static_cast<size_t>(cert_size) + 1);
     if (!*out_cert_pem) {
         BIO_free(cert_bio);
         X509_free(cert);
         EVP_PKEY_free(pkey);
         return POSIX_TLS_ERR_OUT_OF_MEMORY;
     }
-    memcpy(*out_cert_pem, cert_data, cert_size);
+    memcpy(*out_cert_pem, cert_data, static_cast<size_t>(cert_size));
     (*out_cert_pem)[cert_size] = '\0';
-    *out_cert_len = (size_t)cert_size;
+    *out_cert_len = static_cast<size_t>(cert_size);
     BIO_free(cert_bio);
 
     /* Export Private Key to PKCS8 PEM BIO */
@@ -237,7 +244,16 @@ int posix_tls_generate_self_signed_cert(char** out_cert_pem,
 
     char* key_data = NULL;
     long key_size = BIO_get_mem_data(key_bio, &key_data);
-    *out_key_pem = (char*)malloc(key_size + 1);
+    if (key_size <= 0 || !key_data) {
+        BIO_free(key_bio);
+        free(*out_cert_pem);
+        *out_cert_pem = NULL;
+        *out_cert_len = 0;
+        X509_free(cert);
+        EVP_PKEY_free(pkey);
+        return POSIX_TLS_ERR_INTERNAL;
+    }
+    *out_key_pem = (char*)malloc(static_cast<size_t>(key_size) + 1);
     if (!*out_key_pem) {
         BIO_free(key_bio);
         free(*out_cert_pem);
@@ -247,9 +263,9 @@ int posix_tls_generate_self_signed_cert(char** out_cert_pem,
         EVP_PKEY_free(pkey);
         return POSIX_TLS_ERR_OUT_OF_MEMORY;
     }
-    memcpy(*out_key_pem, key_data, key_size);
+    memcpy(*out_key_pem, key_data, static_cast<size_t>(key_size));
     (*out_key_pem)[key_size] = '\0';
-    *out_key_len = (size_t)key_size;
+    *out_key_len = static_cast<size_t>(key_size);
     BIO_free(key_bio);
 
     X509_free(cert);

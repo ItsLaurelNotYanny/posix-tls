@@ -14,7 +14,10 @@
 - **String Ownership**:
   - `posix_tls_get_last_error(conn)` returns a pointer to internal static or connection-managed storage valid until the next operation on `conn`. The caller must not modify or free this string.
   - `posix_tls_generate_self_signed_cert(cert_out, cert_len, key_out, key_len)` allocates heap buffers for the PEM outputs. The caller must release each allocated string with `posix_tls_free_string()`.
-- **Thread Safety**: Distinct `posix_tls_connection_t` handles may be operated concurrently on separate threads. Simultaneous access to a single connection handle across threads requires external synchronization.
+- **Thread Safety**: Distinct `posix_tls_connection_t` handles may be operated concurrently on separate threads. Simultaneous access to a single connection handle across threads requires external synchronization. TLS handshake, stream I/O, and shutdown operations clear stale thread-local OpenSSL errors before invoking OpenSSL I/O primitives so unrelated cryptographic or PEM failures on the same thread cannot corrupt nonblocking readiness signaling.
+- **Buffer Length Limits and Fullchain Credentials**:
+  - Single-call buffer and PEM length parameters (`posix_tls_random_bytes`, `posix_tls_read`, `posix_tls_write`, `posix_tls_calculate_cert_fingerprint`, and `posix_tls_context_set_credentials`) must be non-zero and at most `INT_MAX` bytes (`1 <= len <= INT_MAX`). Zero or oversized lengths fail immediately with `POSIX_TLS_ERR_INVALID_ARG` before touching caller buffers or narrowing integer sizes.
+  - `posix_tls_context_set_credentials` accepts either a single leaf certificate PEM or a concatenated fullchain PEM (leaf certificate first, followed by intermediate CA certificates in chain order). Malformed trailing PEM blocks fail closed with `POSIX_TLS_ERR_INVALID_ARG`.
 
 ## 3. Nonblocking I/O and Retry-Buffer Rules
 
@@ -27,7 +30,7 @@
 
 - `posix_tls_shutdown(conn)` transmits the local TLS `close_notify` alert.
 - Once the local `close_notify` alert is sent (or if the peer closure has already been received), the connection transitions to the closed state and `posix_tls_shutdown` returns `POSIX_TLS_OK` (0).
-- Any subsequent call to `posix_tls_shutdown` on a connection that has reached the closed state returns `POSIX_TLS_ERR_CLOSED` (-3).
+- Any subsequent call to `posix_tls_shutdown`, `posix_tls_connect`, or `posix_tls_accept` on a connection that has reached the closed state returns `POSIX_TLS_ERR_CLOSED` (-3) without reopening or restoring authentication.
 - Any subsequent call to `posix_tls_read` or `posix_tls_write` on a connection that has reached the closed state returns `POSIX_TLS_ERR_IO_FAILED` (-13), distinguishing post-shutdown I/O attempts from a peer closure alert received during active transfer (`POSIX_TLS_ERR_CLOSED` / -3).
 - In nonblocking mode, if alert transmission cannot complete immediately, `posix_tls_shutdown` returns `POSIX_TLS_ERR_WANT_WRITE` or `POSIX_TLS_ERR_WANT_READ`. The application must wait for socket readiness and retry until `POSIX_TLS_OK` or an error is returned.
 

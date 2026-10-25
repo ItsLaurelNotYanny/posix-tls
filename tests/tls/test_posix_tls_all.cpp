@@ -3,16 +3,24 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
 
 #include <iostream>
 #include <sstream>
+#include <vector>
+#include <climits>
 #include <cassert>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -964,6 +972,546 @@ static void test_real_ip_san_matching() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 17: Length Bounds & Integer Narrowing Guards (R1-01)
+// ---------------------------------------------------------------------------
+static void test_length_bounds_and_narrowing_guards() {
+    // 1. Multi-block CSPRNG fill (> 64 KiB DRBG request block)
+    std::vector<unsigned char> multi_buf(131072, 0xa5);
+    TEST_ASSERT(posix_tls_random_bytes(&multi_buf[0], multi_buf.size()) == POSIX_TLS_OK,
+                "128 KiB random_bytes must succeed");
+    bool head_changed = false;
+    bool tail_changed = false;
+    for (size_t i = 0; i < 32; ++i) {
+        if (multi_buf[i] != 0xa5) head_changed = true;
+        if (multi_buf[multi_buf.size() - 32 + i] != 0xa5) tail_changed = true;
+    }
+    TEST_ASSERT(head_changed && tail_changed, "Multi-block random_bytes must populate entire buffer");
+
+    // Prepare valid credentials and an authenticated connection for PEM & stream checks
+    std::string valid_cert, valid_key, valid_pin;
+    TEST_ASSERT(posix_tls::generateSelfSignedCert(valid_cert, valid_key) == POSIX_TLS_OK,
+                "generateSelfSignedCert failed");
+    TEST_ASSERT(posix_tls::calculateCertFingerprint(valid_cert, valid_pin) == POSIX_TLS_OK,
+                "calculateCertFingerprint failed");
+
+    posix_tls_context_t* s_ctx = posix_tls_context_create(POSIX_TLS_POLICY_P2P);
+    posix_tls_context_t* c_ctx = posix_tls_context_create(POSIX_TLS_POLICY_P2P);
+    TEST_ASSERT(s_ctx != NULL && c_ctx != NULL, "Context create failed");
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, valid_cert.data(), valid_cert.size(),
+                                                  valid_key.data(), valid_key.size()) == POSIX_TLS_OK,
+                "Server set_credentials failed");
+    TEST_ASSERT(posix_tls_context_set_expected_fingerprint(c_ctx, valid_pin.c_str()) == POSIX_TLS_OK,
+                "Client set_expected_fingerprint failed");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+    fcntl(sv[0], F_SETFL, O_NONBLOCK);
+    fcntl(sv[1], F_SETFL, O_NONBLOCK);
+    posix_tls_connection_t* s_conn = posix_tls_connection_create(s_ctx, sv[0]);
+    posix_tls_connection_t* c_conn = posix_tls_connection_create(c_ctx, sv[1]);
+    TEST_ASSERT(s_conn != NULL && c_conn != NULL, "Connection create failed");
+
+    int sr = -1, cr = -1;
+    for (int i = 0; i < 1000 && (sr != POSIX_TLS_OK || cr != POSIX_TLS_OK); ++i) {
+        if (sr != POSIX_TLS_OK) sr = posix_tls_accept(s_conn);
+        if (cr != POSIX_TLS_OK) cr = posix_tls_connect(c_conn, NULL);
+    }
+    TEST_ASSERT(sr == POSIX_TLS_OK && cr == POSIX_TLS_OK, "Nonblocking handshake failed");
+
+    // 2. Zero-length policy across random, PEM, and stream APIs
+    char fp_hex[65];
+    size_t io_n = 99;
+    unsigned char small_buf[64];
+    std::memset(small_buf, 0xa5, sizeof(small_buf));
+    TEST_ASSERT(posix_tls_random_bytes(small_buf, 0) == POSIX_TLS_ERR_INVALID_ARG,
+                "Zero-length random_bytes must fail with INVALID_ARG");
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint(valid_cert.data(), 0, fp_hex) == POSIX_TLS_ERR_INVALID_ARG,
+                "Zero-length cert fingerprint must fail with INVALID_ARG");
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, valid_cert.data(), 0,
+                                                  valid_key.data(), valid_key.size()) == POSIX_TLS_ERR_INVALID_ARG,
+                "Zero-length cert_len must fail with INVALID_ARG");
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, valid_cert.data(), valid_cert.size(),
+                                                  valid_key.data(), 0) == POSIX_TLS_ERR_INVALID_ARG,
+                "Zero-length key_len must fail with INVALID_ARG");
+    TEST_ASSERT(posix_tls_read(c_conn, small_buf, 0, &io_n) == POSIX_TLS_ERR_INVALID_ARG && io_n == 0,
+                "Zero-length read must fail with INVALID_ARG");
+    TEST_ASSERT(posix_tls_write(c_conn, small_buf, 0, &io_n) == POSIX_TLS_ERR_INVALID_ARG && io_n == 0,
+                "Zero-length write must fail with INVALID_ARG");
+
+    // 3. Maximum-length boundary (INT_MAX + 1 -> negative int if narrowed!) with PROT_NONE guard page
+    const size_t over_max = static_cast<size_t>(INT_MAX) + static_cast<size_t>(1);
+    void* guard_page = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char* unmapped_or_sentinel = (guard_page != MAP_FAILED)
+        ? static_cast<unsigned char*>(guard_page) : small_buf;
+    const char* unmapped_pem = reinterpret_cast<const char*>(unmapped_or_sentinel);
+
+    TEST_ASSERT(posix_tls_random_bytes(unmapped_or_sentinel, over_max) == POSIX_TLS_ERR_INVALID_ARG,
+                "INT_MAX + 1 random_bytes must fail before touching buffer");
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint(unmapped_pem, over_max, fp_hex) == POSIX_TLS_ERR_INVALID_ARG,
+                "INT_MAX + 1 cert_len must fail without triggering BIO_new_mem_buf strlen sentinel");
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, unmapped_pem, over_max,
+                                                  valid_key.data(), valid_key.size()) == POSIX_TLS_ERR_INVALID_ARG,
+                "INT_MAX + 1 credential cert_len must fail before touching buffer");
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, valid_cert.data(), valid_cert.size(),
+                                                  unmapped_pem, over_max) == POSIX_TLS_ERR_INVALID_ARG,
+                "INT_MAX + 1 credential key_len must fail before touching buffer");
+    io_n = 77;
+    TEST_ASSERT(posix_tls_read(c_conn, unmapped_or_sentinel, over_max, &io_n) == POSIX_TLS_ERR_INVALID_ARG && io_n == 0,
+                "INT_MAX + 1 read must fail before touching buffer");
+    io_n = 77;
+    TEST_ASSERT(posix_tls_write(c_conn, unmapped_or_sentinel, over_max, &io_n) == POSIX_TLS_ERR_INVALID_ARG && io_n == 0,
+                "INT_MAX + 1 write must fail before touching buffer");
+
+    // 4. 64-bit wrapping length ((1 << 32) + 32 -> narrows to +32 if truncated) without huge physical allocation
+    if (sizeof(size_t) > 4) {
+        size_t shift = (sizeof(size_t) > 4) ? 32 : 0;
+        size_t wrap_len = (static_cast<size_t>(1) << shift) + static_cast<size_t>(32);
+
+        TEST_ASSERT(posix_tls_random_bytes(unmapped_or_sentinel, wrap_len) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping random_bytes must fail before touching PROT_NONE buffer");
+        TEST_ASSERT(posix_tls_random_bytes(small_buf, wrap_len) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping random_bytes must return INVALID_ARG");
+        for (size_t i = 0; i < sizeof(small_buf); ++i) {
+            TEST_ASSERT(small_buf[i] == 0xa5, "Rejected 64-bit wrapping random_bytes must leave buffer untouched");
+        }
+
+        size_t wrap_cert_len = (static_cast<size_t>(1) << shift) + valid_cert.size();
+        TEST_ASSERT(posix_tls_calculate_cert_fingerprint(valid_cert.data(), wrap_cert_len, fp_hex) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping cert_len must fail instead of truncating to valid_cert.size()");
+        TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, valid_cert.data(), wrap_cert_len,
+                                                      valid_key.data(), valid_key.size()) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping credential cert_len must fail");
+        TEST_ASSERT(posix_tls_read(c_conn, unmapped_or_sentinel, wrap_len, &io_n) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping read length must fail before touching buffer");
+        TEST_ASSERT(posix_tls_write(c_conn, unmapped_or_sentinel, wrap_len, &io_n) == POSIX_TLS_ERR_INVALID_ARG,
+                    "64-bit wrapping write length must fail before touching buffer");
+    }
+
+    if (guard_page != MAP_FAILED) {
+        munmap(guard_page, 4096);
+    }
+    posix_tls_connection_destroy(c_conn);
+    posix_tls_connection_destroy(s_conn);
+    posix_tls_context_destroy(c_ctx);
+    posix_tls_context_destroy(s_ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: Stale OpenSSL Error Queue Isolation Across Readiness & Diagnostics (R1-02)
+// ---------------------------------------------------------------------------
+static void test_stale_openssl_error_queue_isolation() {
+    std::string cert, key, pin;
+    TEST_ASSERT(posix_tls::generateSelfSignedCert(cert, key) == POSIX_TLS_OK, "Cert gen failed");
+    TEST_ASSERT(posix_tls::calculateCertFingerprint(cert, pin) == POSIX_TLS_OK, "Fingerprint failed");
+
+    posix_tls::Context server_ctx(POSIX_TLS_POLICY_P2P);
+    posix_tls::Context client_ctx(POSIX_TLS_POLICY_P2P);
+    TEST_ASSERT(server_ctx.setCredentials(cert, key) == POSIX_TLS_OK, "Server creds failed");
+    TEST_ASSERT(client_ctx.setExpectedFingerprint(pin) == POSIX_TLS_OK, "Client pin failed");
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+    fcntl(sv[0], F_SETFL, O_NONBLOCK);
+    fcntl(sv[1], F_SETFL, O_NONBLOCK);
+
+    posix_tls::Connection s(server_ctx, sv[0]);
+    posix_tls::Connection c(client_ctx, sv[1]);
+    TEST_ASSERT(s.isValid() && c.isValid(), "Connection creation failed");
+
+    // 1. Contaminate error queue via public SDK before every nonblocking handshake step
+    char bad_fp[65];
+    int sr = -1, cr = -1;
+    bool observed_want = false;
+    for (int i = 0; i < 1000 && (sr != POSIX_TLS_OK || cr != POSIX_TLS_OK); ++i) {
+        if (cr != POSIX_TLS_OK) {
+            TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                        "Expected INVALID_ARG on bad PEM");
+            cr = c.connect("");
+            if (cr == POSIX_TLS_ERR_WANT_READ || cr == POSIX_TLS_ERR_WANT_WRITE) observed_want = true;
+            TEST_ASSERT(cr == POSIX_TLS_OK || cr == POSIX_TLS_ERR_WANT_READ || cr == POSIX_TLS_ERR_WANT_WRITE,
+                        "Stale error queue must not break nonblocking connect");
+        }
+        if (sr != POSIX_TLS_OK) {
+            TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                        "Expected INVALID_ARG on bad PEM");
+            sr = s.accept();
+            if (sr == POSIX_TLS_ERR_WANT_READ || sr == POSIX_TLS_ERR_WANT_WRITE) observed_want = true;
+            TEST_ASSERT(sr == POSIX_TLS_OK || sr == POSIX_TLS_ERR_WANT_READ || sr == POSIX_TLS_ERR_WANT_WRITE,
+                        "Stale error queue must not break nonblocking accept");
+        }
+    }
+    TEST_ASSERT(observed_want && sr == POSIX_TLS_OK && cr == POSIX_TLS_OK,
+                "Nonblocking handshake with contaminated queue must complete");
+
+    // 2. Nonblocking WANT_READ preserved after public SDK PEM failure
+    size_t n = 0;
+    char out[32];
+    TEST_ASSERT(c.read(out, sizeof(out), n) == POSIX_TLS_ERR_WANT_READ, "Clean empty read must return WANT_READ");
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                "Expected INVALID_ARG on bad PEM");
+    TEST_ASSERT(c.read(out, sizeof(out), n) == POSIX_TLS_ERR_WANT_READ,
+                "Dirty empty read must still return WANT_READ");
+
+    // 3. Nonblocking WANT_WRITE preserved after public SDK PEM failure
+    std::vector<char> chunk(16384, 'W');
+    size_t total_sent = 0;
+    bool hit_want_write = false;
+    for (int i = 0; i < 512; ++i) {
+        size_t written = 0;
+        int wrc = c.write(&chunk[0], chunk.size(), written);
+        if (wrc == POSIX_TLS_OK) {
+            total_sent += written;
+        } else if (wrc == POSIX_TLS_ERR_WANT_WRITE) {
+            hit_want_write = true;
+            break;
+        } else {
+            TEST_ASSERT(false, "Unexpected write error while filling socket buffer");
+        }
+    }
+    TEST_ASSERT(hit_want_write, "Expected nonblocking write backpressure");
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                "Expected INVALID_ARG on bad PEM");
+    size_t retry_written = 0;
+    int dirty_wrc = c.write(&chunk[0], chunk.size(), retry_written);
+    TEST_ASSERT(dirty_wrc == POSIX_TLS_ERR_WANT_WRITE,
+                "Dirty backpressured write must still return WANT_WRITE");
+
+    // Drain peer so the pending write completes cleanly
+    std::vector<char> drain(16384);
+    size_t total_rcvd = 0;
+    while (dirty_wrc == POSIX_TLS_ERR_WANT_WRITE) {
+        size_t nr = 0;
+        int rrc = s.read(&drain[0], drain.size(), nr);
+        if (rrc == POSIX_TLS_OK) total_rcvd += nr;
+        dirty_wrc = c.write(&chunk[0], chunk.size(), retry_written);
+    }
+    TEST_ASSERT(dirty_wrc == POSIX_TLS_OK, "Pending write must complete once socket drains");
+    total_sent += retry_written;
+    while (total_rcvd < total_sent) {
+        size_t nr = 0;
+        int rrc = s.read(&drain[0], drain.size(), nr);
+        TEST_ASSERT(rrc == POSIX_TLS_OK, "Server drain read must succeed");
+        total_rcvd += nr;
+    }
+
+    // 4. Shutdown preserved after public SDK PEM failure
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                "Expected INVALID_ARG on bad PEM");
+    TEST_ASSERT(c.shutdown() == POSIX_TLS_OK, "Dirty shutdown must succeed");
+
+    // 5. Genuine TLS failure still fails and preserves fresh diagnostic (not stale PEM error)
+    int bad_sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, bad_sv) == 0, "socketpair failed");
+    const char raw_garbage[] = "NOT_A_VALID_TLS_RECORD\r\n";
+    TEST_ASSERT(write(bad_sv[0], raw_garbage, sizeof(raw_garbage) - 1) > 0, "raw write failed");
+    close(bad_sv[0]);
+
+    posix_tls::Connection bad_client(client_ctx, bad_sv[1]);
+    TEST_ASSERT(bad_client.isValid(), "bad_client create failed");
+    TEST_ASSERT(posix_tls_calculate_cert_fingerprint("bad", 3, bad_fp) == POSIX_TLS_ERR_INVALID_ARG,
+                "Expected INVALID_ARG on bad PEM");
+    int bad_rc = bad_client.connect("");
+    TEST_ASSERT(bad_rc == POSIX_TLS_ERR_HANDSHAKE_FAILED, "Corrupt peer record must fail handshake");
+    std::string diag = bad_client.getLastError();
+    TEST_ASSERT(!diag.empty() && diag.find("PEM") == std::string::npos,
+                "Last error must reflect fresh TLS failure rather than stale PEM error");
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: CLOSED State Remains Terminal Across Connect and Accept (R1-03)
+// ---------------------------------------------------------------------------
+static void test_closed_state_terminal_across_handshakes() {
+    std::string cert, key, pin;
+    TEST_ASSERT(posix_tls::generateSelfSignedCert(cert, key) == POSIX_TLS_OK, "Cert gen failed");
+    TEST_ASSERT(posix_tls::calculateCertFingerprint(cert, pin) == POSIX_TLS_OK, "Fingerprint failed");
+
+    posix_tls::Context server_ctx(POSIX_TLS_POLICY_P2P);
+    posix_tls::Context client_ctx(POSIX_TLS_POLICY_P2P);
+    TEST_ASSERT(server_ctx.setCredentials(cert, key) == POSIX_TLS_OK, "Server creds failed");
+    TEST_ASSERT(client_ctx.setExpectedFingerprint(pin) == POSIX_TLS_OK, "Client pin failed");
+
+    // Scenario A: Client shuts down locally while peer bytes are queued
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+        fcntl(sv[0], F_SETFL, O_NONBLOCK);
+        fcntl(sv[1], F_SETFL, O_NONBLOCK);
+
+        posix_tls::Connection s(server_ctx, sv[0]);
+        posix_tls::Connection c(client_ctx, sv[1]);
+        int sr = -1, cr = -1;
+        for (int i = 0; i < 1000 && (sr != POSIX_TLS_OK || cr != POSIX_TLS_OK); ++i) {
+            if (sr != POSIX_TLS_OK) sr = s.accept();
+            if (cr != POSIX_TLS_OK) cr = c.connect("");
+        }
+        TEST_ASSERT(sr == POSIX_TLS_OK && cr == POSIX_TLS_OK, "Handshake failed");
+
+        // Re-handshaking an already authenticated handle must be rejected without breaking it
+        TEST_ASSERT(c.connect("") == POSIX_TLS_ERR_INVALID_ARG, "Authenticated connect must return INVALID_ARG");
+        TEST_ASSERT(c.accept() == POSIX_TLS_ERR_INVALID_ARG, "Authenticated accept must return INVALID_ARG");
+
+        size_t n = 0;
+        TEST_ASSERT(s.write("hello", 5, n) == POSIX_TLS_OK && n == 5, "Server write failed");
+        TEST_ASSERT(c.shutdown() == POSIX_TLS_OK, "Client shutdown failed");
+
+        char buf[16];
+        TEST_ASSERT(c.read(buf, sizeof(buf), n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Post-shutdown client read must return IO_FAILED");
+        TEST_ASSERT(c.write("x", 1, n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Post-shutdown client write must return IO_FAILED");
+
+        TEST_ASSERT(c.connect("") == POSIX_TLS_ERR_CLOSED,
+                    "Post-shutdown client connect must return CLOSED");
+        TEST_ASSERT(c.accept() == POSIX_TLS_ERR_CLOSED,
+                    "Post-shutdown client accept must return CLOSED");
+
+        TEST_ASSERT(c.read(buf, sizeof(buf), n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Client read after rejected connect/accept must remain IO_FAILED");
+        TEST_ASSERT(c.write("x", 1, n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Client write after rejected connect/accept must remain IO_FAILED");
+        TEST_ASSERT(c.shutdown() == POSIX_TLS_ERR_CLOSED,
+                    "Repeated client shutdown must remain CLOSED");
+    }
+
+    // Scenario B: Server shuts down locally while client bytes are queued
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+        fcntl(sv[0], F_SETFL, O_NONBLOCK);
+        fcntl(sv[1], F_SETFL, O_NONBLOCK);
+
+        posix_tls::Connection s(server_ctx, sv[0]);
+        posix_tls::Connection c(client_ctx, sv[1]);
+        int sr = -1, cr = -1;
+        for (int i = 0; i < 1000 && (sr != POSIX_TLS_OK || cr != POSIX_TLS_OK); ++i) {
+            if (sr != POSIX_TLS_OK) sr = s.accept();
+            if (cr != POSIX_TLS_OK) cr = c.connect("");
+        }
+        TEST_ASSERT(sr == POSIX_TLS_OK && cr == POSIX_TLS_OK, "Handshake failed");
+
+        size_t n = 0;
+        TEST_ASSERT(c.write("world", 5, n) == POSIX_TLS_OK && n == 5, "Client write failed");
+        TEST_ASSERT(s.shutdown() == POSIX_TLS_OK, "Server shutdown failed");
+
+        char buf[16];
+        TEST_ASSERT(s.read(buf, sizeof(buf), n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Post-shutdown server read must return IO_FAILED");
+        TEST_ASSERT(s.write("y", 1, n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Post-shutdown server write must return IO_FAILED");
+
+        TEST_ASSERT(s.accept() == POSIX_TLS_ERR_CLOSED,
+                    "Post-shutdown server accept must return CLOSED");
+        TEST_ASSERT(s.connect("") == POSIX_TLS_ERR_CLOSED,
+                    "Post-shutdown server connect must return CLOSED");
+
+        TEST_ASSERT(s.read(buf, sizeof(buf), n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Server read after rejected accept/connect must remain IO_FAILED");
+        TEST_ASSERT(s.write("y", 1, n) == POSIX_TLS_ERR_IO_FAILED && n == 0,
+                    "Server write after rejected accept/connect must remain IO_FAILED");
+        TEST_ASSERT(s.shutdown() == POSIX_TLS_ERR_CLOSED,
+                    "Repeated server shutdown must remain CLOSED");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: Intermediate Certificate Chain Loading & Root-Only Verification (R1-04)
+// ---------------------------------------------------------------------------
+static void add_x509_ext(X509* issuer, X509* subj, int nid, const char* value) {
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, issuer, subj, NULL, NULL, 0);
+    X509_EXTENSION* ext = X509V3_EXT_conf_nid(NULL, &ctx, nid, const_cast<char*>(value));
+    TEST_ASSERT(ext != NULL, "X509V3_EXT_conf_nid failed");
+    TEST_ASSERT(X509_add_ext(subj, ext, -1) == 1, "X509_add_ext failed");
+    X509_EXTENSION_free(ext);
+}
+
+static X509* build_test_cert(const char* cn,
+                             long serial_no,
+                             EVP_PKEY* subj_key,
+                             X509* issuer_cert,
+                             EVP_PKEY* issuer_key,
+                             bool is_ca,
+                             const char* san_dns) {
+    X509* cert = X509_new();
+    TEST_ASSERT(cert != NULL, "X509_new failed");
+    X509_set_version(cert, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert), serial_no);
+    X509_gmtime_adj(X509_getm_notBefore(cert), -60);
+    X509_gmtime_adj(X509_getm_notAfter(cert), 86400);
+
+    X509_NAME* name = X509_NAME_new();
+    TEST_ASSERT(name != NULL, "X509_NAME_new failed");
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(cn), -1, -1, 0);
+    X509_set_subject_name(cert, name);
+    X509_set_issuer_name(cert, issuer_cert ? X509_get_subject_name(issuer_cert) : name);
+    X509_NAME_free(name);
+
+    X509_set_pubkey(cert, subj_key);
+
+    X509* v3_issuer = issuer_cert ? issuer_cert : cert;
+    add_x509_ext(v3_issuer, cert, NID_basic_constraints,
+                 is_ca ? "critical,CA:TRUE" : "critical,CA:FALSE");
+    add_x509_ext(v3_issuer, cert, NID_key_usage,
+                 is_ca ? "critical,keyCertSign,cRLSign" : "critical,digitalSignature");
+    add_x509_ext(v3_issuer, cert, NID_subject_key_identifier, "hash");
+    add_x509_ext(v3_issuer, cert, NID_authority_key_identifier, "keyid:always");
+    if (!is_ca) {
+        add_x509_ext(v3_issuer, cert, NID_ext_key_usage, "serverAuth");
+    }
+    if (san_dns) {
+        add_x509_ext(v3_issuer, cert, NID_subject_alt_name, san_dns);
+    }
+
+    TEST_ASSERT(X509_sign(cert, issuer_key ? issuer_key : subj_key, EVP_sha256()) > 0,
+                "X509_sign failed");
+    return cert;
+}
+
+static std::string cert_to_pem_string(X509* cert) {
+    BIO* bio = BIO_new(BIO_s_mem());
+    TEST_ASSERT(bio != NULL && PEM_write_bio_X509(bio, cert) == 1, "PEM_write_bio_X509 failed");
+    char* data = NULL;
+    long len = BIO_get_mem_data(bio, &data);
+    TEST_ASSERT(len > 0 && data != NULL, "BIO_get_mem_data failed");
+    std::string out(data, static_cast<size_t>(len));
+    BIO_free(bio);
+    return out;
+}
+
+static std::string key_to_pem_string(EVP_PKEY* key) {
+    BIO* bio = BIO_new(BIO_s_mem());
+    TEST_ASSERT(bio != NULL && PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL) == 1,
+                "PEM_write_bio_PrivateKey failed");
+    char* data = NULL;
+    long len = BIO_get_mem_data(bio, &data);
+    TEST_ASSERT(len > 0 && data != NULL, "BIO_get_mem_data failed");
+    std::string out(data, static_cast<size_t>(len));
+    BIO_free(bio);
+    return out;
+}
+
+static void test_fullchain_credentials_and_chain_validation() {
+    EVP_PKEY* root_key = EVP_EC_gen("P-256");
+    EVP_PKEY* int_key = EVP_EC_gen("P-256");
+    EVP_PKEY* leaf_key = EVP_EC_gen("P-256");
+    TEST_ASSERT(root_key && int_key && leaf_key, "EVP_EC_gen failed");
+
+    X509* root_cert = build_test_cert("posix-tls Test Root CA", 1, root_key, NULL, NULL, true, NULL);
+    X509* int_cert = build_test_cert("posix-tls Test Intermediate CA", 2, int_key, root_cert, root_key, true, NULL);
+    X509* leaf_cert = build_test_cert("localhost", 3, leaf_key, int_cert, int_key, false, "DNS:localhost");
+
+    std::string root_pem = cert_to_pem_string(root_cert);
+    std::string int_pem = cert_to_pem_string(int_cert);
+    std::string leaf_pem = cert_to_pem_string(leaf_cert);
+    std::string leaf_key_pem = key_to_pem_string(leaf_key);
+    std::string fullchain_pem = leaf_pem + int_pem;
+
+    std::string expected_leaf_fp;
+    TEST_ASSERT(posix_tls::calculateCertFingerprint(leaf_pem, expected_leaf_fp) == POSIX_TLS_OK,
+                "Leaf fingerprint calculation failed");
+
+    char root_ca_file[] = "/tmp/posix_tls_root_only_XXXXXX";
+    int ca_fd = mkstemp(root_ca_file);
+    TEST_ASSERT(ca_fd >= 0, "mkstemp failed");
+    TEST_ASSERT(write(ca_fd, root_pem.data(), root_pem.size()) == static_cast<ssize_t>(root_pem.size()),
+                "Writing root CA file failed");
+    close(ca_fd);
+
+    posix_tls_context_t* s_ctx = posix_tls_context_create(POSIX_TLS_POLICY_P2P);
+    TEST_ASSERT(s_ctx != NULL, "Server context create failed");
+
+    // 1. Malformed trailing chain PEM block must fail closed
+    std::string malformed_chain = leaf_pem +
+        "-----BEGIN CERTIFICATE-----\nCORRUPT_PEM_BODY@@@\n-----END CERTIFICATE-----\n";
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, malformed_chain.data(), malformed_chain.size(),
+                                                  leaf_key_pem.data(), leaf_key_pem.size()) == POSIX_TLS_ERR_INVALID_ARG,
+                "Malformed trailing chain certificate must fail with INVALID_ARG");
+
+    // 2. Leaf-only credentials without intermediate must fail verification when client trusts only Root CA
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, leaf_pem.data(), leaf_pem.size(),
+                                                  leaf_key_pem.data(), leaf_key_pem.size()) == POSIX_TLS_OK,
+                "Leaf-only set_credentials failed");
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+        ServerThreadArg sarg;
+        sarg.ctx = s_ctx;
+        sarg.fd = sv[0];
+        sarg.result_rc = -999;
+        pthread_t st;
+        TEST_ASSERT(pthread_create(&st, NULL, p2p_server_worker, &sarg) == 0, "pthread_create failed");
+
+        posix_tls_context_t* c_ctx = posix_tls_context_create(POSIX_TLS_POLICY_PUBLIC_PKI);
+        TEST_ASSERT(posix_tls_context_set_ca_path(c_ctx, root_ca_file) == POSIX_TLS_OK, "set_ca_path failed");
+        posix_tls_connection_t* c_conn = posix_tls_connection_create(c_ctx, sv[1]);
+        int crc = posix_tls_connect(c_conn, "localhost");
+        TEST_ASSERT(crc == POSIX_TLS_ERR_CERT_VERIFY,
+                    "Missing intermediate must fail Public PKI verification against root-only trust store");
+        posix_tls_connection_destroy(c_conn);
+        pthread_join(st, NULL);
+        posix_tls_context_destroy(c_ctx);
+    }
+
+    // 3. Fullchain credentials (leaf + intermediate) must succeed when client trusts only Root CA
+    TEST_ASSERT(posix_tls_context_set_credentials(s_ctx, fullchain_pem.data(), fullchain_pem.size(),
+                                                  leaf_key_pem.data(), leaf_key_pem.size()) == POSIX_TLS_OK,
+                "Fullchain set_credentials failed");
+    {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair failed");
+        ServerThreadArg sarg;
+        sarg.ctx = s_ctx;
+        sarg.fd = sv[0];
+        sarg.result_rc = -999;
+        pthread_t st;
+        TEST_ASSERT(pthread_create(&st, NULL, p2p_server_worker, &sarg) == 0, "pthread_create failed");
+
+        posix_tls_context_t* c_ctx = posix_tls_context_create(POSIX_TLS_POLICY_PUBLIC_PKI);
+        TEST_ASSERT(posix_tls_context_set_ca_path(c_ctx, root_ca_file) == POSIX_TLS_OK, "set_ca_path failed");
+        posix_tls_connection_t* c_conn = posix_tls_connection_create(c_ctx, sv[1]);
+        int crc = posix_tls_connect(c_conn, "localhost");
+        TEST_ASSERT(crc == POSIX_TLS_OK,
+                    "Fullchain server must verify cleanly against root-only Public PKI client");
+
+        char ver[32];
+        char peer_fp[65];
+        TEST_ASSERT(posix_tls_connection_get_negotiated_version(c_conn, ver, sizeof(ver)) == POSIX_TLS_OK,
+                    "get_negotiated_version failed");
+        TEST_ASSERT(std::strcmp(ver, "TLSv1.3") == 0, "Fullchain session must negotiate TLSv1.3");
+        TEST_ASSERT(posix_tls_connection_get_peer_fingerprint(c_conn, peer_fp) == POSIX_TLS_OK,
+                    "get_peer_fingerprint failed");
+        TEST_ASSERT(expected_leaf_fp == peer_fp, "Peer fingerprint must match leaf certificate");
+
+        const char* msg = "FULLCHAIN_PING";
+        size_t written = 0;
+        TEST_ASSERT(posix_tls_write(c_conn, msg, std::strlen(msg), &written) == POSIX_TLS_OK, "write failed");
+        char resp[64];
+        size_t nread = 0;
+        TEST_ASSERT(posix_tls_read(c_conn, resp, sizeof(resp) - 1, &nread) == POSIX_TLS_OK, "read failed");
+        resp[nread] = '\0';
+        TEST_ASSERT(std::strcmp(resp, "PONG_FROM_SERVER") == 0, "Fullchain echo mismatch");
+
+        posix_tls_shutdown(c_conn);
+        posix_tls_connection_destroy(c_conn);
+        pthread_join(st, NULL);
+        TEST_ASSERT(sarg.result_rc == POSIX_TLS_OK && sarg.received_msg == "FULLCHAIN_PING",
+                    "Server fullchain worker failed");
+        posix_tls_context_destroy(c_ctx);
+    }
+
+    unlink(root_ca_file);
+    posix_tls_context_destroy(s_ctx);
+    X509_free(leaf_cert);
+    X509_free(int_cert);
+    X509_free(root_cert);
+    EVP_PKEY_free(leaf_key);
+    EVP_PKEY_free(int_key);
+    EVP_PKEY_free(root_key);
+}
+
+// ---------------------------------------------------------------------------
 // Main test entrypoint
 // ---------------------------------------------------------------------------
 int main() {
@@ -989,6 +1537,10 @@ int main() {
     run_test(test_entropy_failure_injection, "test_entropy_failure_injection");
     run_test(test_forced_tls_versions_and_rejection, "test_forced_tls_versions_and_rejection");
     run_test(test_real_ip_san_matching, "test_real_ip_san_matching");
+    run_test(test_length_bounds_and_narrowing_guards, "test_length_bounds_and_narrowing_guards");
+    run_test(test_stale_openssl_error_queue_isolation, "test_stale_openssl_error_queue_isolation");
+    run_test(test_closed_state_terminal_across_handshakes, "test_closed_state_terminal_across_handshakes");
+    run_test(test_fullchain_credentials_and_chain_validation, "test_fullchain_credentials_and_chain_validation");
 
     std::cout << "========================================" << std::endl;
     std::cout << " All " << g_test_count << " posix_tls unit tests PASSED!" << std::endl;

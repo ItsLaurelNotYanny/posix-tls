@@ -14,6 +14,8 @@
 #include <pthread.h>
 
 #include <string>
+#include <vector>
+#include <climits>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -84,7 +86,9 @@ static int posix_tls_bio_read(BIO* b, char* out, int outl) {
 
 static int posix_tls_bio_puts(BIO* b, const char* str) {
     if (!str) return 0;
-    return posix_tls_bio_write(b, str, static_cast<int>(strlen(str)));
+    size_t len = strlen(str);
+    int chunk = (len > static_cast<size_t>(INT_MAX)) ? INT_MAX : static_cast<int>(len);
+    return posix_tls_bio_write(b, str, chunk);
 }
 
 static long posix_tls_bio_ctrl(BIO* b, int cmd, long num, void* ptr) {
@@ -164,6 +168,27 @@ static bool normalize_hex_pin(const char* in, std::string& out_hex) {
     }
     out_hex = clean;
     return true;
+}
+
+static void free_cert_list(std::vector<X509*>& certs) {
+    for (size_t i = 0; i < certs.size(); ++i) {
+        if (certs[i]) {
+            X509_free(certs[i]);
+        }
+    }
+    certs.clear();
+}
+
+static void capture_openssl_error(std::string& out_err, const char* fallback_msg) {
+    unsigned long e = ERR_get_error();
+    if (e != 0) {
+        char err_buf[256];
+        ERR_error_string_n(e, err_buf, sizeof(err_buf));
+        out_err = err_buf;
+        ERR_clear_error();
+    } else {
+        out_err = fallback_msg;
+    }
 }
 
 posix_tls_context_t* posix_tls_context_create(posix_tls_policy_t policy) {
@@ -272,49 +297,117 @@ int posix_tls_context_set_credentials(posix_tls_context_t* ctx,
                                      size_t cert_len,
                                      const char* key_pem,
                                      size_t key_len) {
-    if (!ctx || !ctx->ssl_ctx || !cert_pem || cert_len == 0 || !key_pem || key_len == 0) {
+    if (!ctx || !ctx->ssl_ctx ||
+        !cert_pem || cert_len == 0 || cert_len > static_cast<size_t>(INT_MAX) ||
+        !key_pem || key_len == 0 || key_len > static_cast<size_t>(INT_MAX)) {
         return POSIX_TLS_ERR_INVALID_ARG;
     }
 
-    // Load Certificate
+    ERR_clear_error();
+
+    // Parse leaf certificate and any intermediate chain certificates from cert_pem
     BIO* cert_bio = BIO_new_mem_buf(cert_pem, static_cast<int>(cert_len));
     if (!cert_bio) {
         return POSIX_TLS_ERR_OUT_OF_MEMORY;
     }
-    X509* cert = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
-    BIO_free(cert_bio);
-    if (!cert) {
+    X509* leaf_cert = PEM_read_bio_X509_AUX(cert_bio, NULL, NULL, NULL);
+    if (!leaf_cert) {
+        BIO_free(cert_bio);
+        ERR_clear_error();
         ctx->last_error = "Failed to parse certificate PEM";
         return POSIX_TLS_ERR_INVALID_ARG;
     }
 
-    if (SSL_CTX_use_certificate(ctx->ssl_ctx, cert) <= 0) {
-        X509_free(cert);
-        ctx->last_error = "SSL_CTX_use_certificate failed";
-        return POSIX_TLS_ERR_INTERNAL;
+    std::vector<X509*> chain_certs;
+    for (;;) {
+        X509* ca_cert = PEM_read_bio_X509(cert_bio, NULL, NULL, NULL);
+        if (ca_cert != NULL) {
+            chain_certs.push_back(ca_cert);
+        } else {
+            break;
+        }
     }
-    X509_free(cert);
+    BIO_free(cert_bio);
 
-    // Load Private Key
+    unsigned long pem_err = ERR_peek_last_error();
+    if (ERR_GET_LIB(pem_err) == ERR_LIB_PEM &&
+        ERR_GET_REASON(pem_err) == PEM_R_NO_START_LINE) {
+        ERR_clear_error();
+    } else {
+        free_cert_list(chain_certs);
+        X509_free(leaf_cert);
+        ERR_clear_error();
+        ctx->last_error = "Failed to parse intermediate certificate chain PEM";
+        return POSIX_TLS_ERR_INVALID_ARG;
+    }
+
+    // Parse private key and verify match before modifying SSL_CTX
     BIO* key_bio = BIO_new_mem_buf(key_pem, static_cast<int>(key_len));
     if (!key_bio) {
+        free_cert_list(chain_certs);
+        X509_free(leaf_cert);
         return POSIX_TLS_ERR_OUT_OF_MEMORY;
     }
     EVP_PKEY* pkey = PEM_read_bio_PrivateKey(key_bio, NULL, NULL, NULL);
     BIO_free(key_bio);
     if (!pkey) {
+        free_cert_list(chain_certs);
+        X509_free(leaf_cert);
+        ERR_clear_error();
         ctx->last_error = "Failed to parse private key PEM";
         return POSIX_TLS_ERR_INVALID_ARG;
     }
 
+    if (X509_check_private_key(leaf_cert, pkey) <= 0) {
+        EVP_PKEY_free(pkey);
+        free_cert_list(chain_certs);
+        X509_free(leaf_cert);
+        ERR_clear_error();
+        ctx->last_error = "Private key does not match certificate";
+        return POSIX_TLS_ERR_INTERNAL;
+    }
+
+    ERR_clear_error();
+    if (SSL_CTX_use_certificate(ctx->ssl_ctx, leaf_cert) <= 0 || ERR_peek_error() != 0) {
+        EVP_PKEY_free(pkey);
+        free_cert_list(chain_certs);
+        X509_free(leaf_cert);
+        ERR_clear_error();
+        ctx->last_error = "SSL_CTX_use_certificate failed";
+        return POSIX_TLS_ERR_INTERNAL;
+    }
+    X509_free(leaf_cert);
+
+    if (SSL_CTX_clear_chain_certs(ctx->ssl_ctx) <= 0) {
+        EVP_PKEY_free(pkey);
+        free_cert_list(chain_certs);
+        ERR_clear_error();
+        ctx->last_error = "SSL_CTX_clear_chain_certs failed";
+        return POSIX_TLS_ERR_INTERNAL;
+    }
+
+    for (size_t i = 0; i < chain_certs.size(); ++i) {
+        if (SSL_CTX_add1_chain_cert(ctx->ssl_ctx, chain_certs[i]) <= 0) {
+            SSL_CTX_clear_chain_certs(ctx->ssl_ctx);
+            EVP_PKEY_free(pkey);
+            free_cert_list(chain_certs);
+            ERR_clear_error();
+            ctx->last_error = "SSL_CTX_add1_chain_cert failed";
+            return POSIX_TLS_ERR_INTERNAL;
+        }
+    }
+    free_cert_list(chain_certs);
+
     if (SSL_CTX_use_PrivateKey(ctx->ssl_ctx, pkey) <= 0) {
         EVP_PKEY_free(pkey);
+        ERR_clear_error();
         ctx->last_error = "SSL_CTX_use_PrivateKey failed";
         return POSIX_TLS_ERR_INTERNAL;
     }
     EVP_PKEY_free(pkey);
 
     if (SSL_CTX_check_private_key(ctx->ssl_ctx) <= 0) {
+        ERR_clear_error();
         ctx->last_error = "Private key does not match certificate";
         return POSIX_TLS_ERR_INTERNAL;
     }
@@ -428,6 +521,14 @@ int posix_tls_connect(posix_tls_connection_t* conn, const char* hostname) {
     if (conn->state == POSIX_TLS_STATE_FAILED) {
         return POSIX_TLS_ERR_PIN_MISMATCH;
     }
+    if (conn->state == POSIX_TLS_STATE_CLOSED) {
+        conn->last_error = "Connection is closed";
+        return POSIX_TLS_ERR_CLOSED;
+    }
+    if (conn->state == POSIX_TLS_STATE_AUTHENTICATED) {
+        conn->last_error = "Connection is already authenticated";
+        return POSIX_TLS_ERR_INVALID_ARG;
+    }
 
     if (conn->ctx->policy == POSIX_TLS_POLICY_PUBLIC_PKI) {
         if (!hostname || hostname[0] == '\0') {
@@ -443,6 +544,7 @@ int posix_tls_connect(posix_tls_connection_t* conn, const char* hostname) {
         if (!is_ip) {
             // Set SNI extension (RFC 6066: literal IP addresses must not be sent in SNI)
             if (SSL_set_tlsext_host_name(conn->ssl, hostname) <= 0) {
+                ERR_clear_error();
                 conn->last_error = "Failed to set TLS SNI extension";
                 return POSIX_TLS_ERR_INTERNAL;
             }
@@ -457,12 +559,14 @@ int posix_tls_connect(posix_tls_connection_t* conn, const char* hostname) {
 
         if (is_ip) {
             if (X509_VERIFY_PARAM_set1_ip_asc(param, hostname) != 1) {
+                ERR_clear_error();
                 conn->last_error = "Failed to set verification IP parameter";
                 return POSIX_TLS_ERR_INTERNAL;
             }
         } else {
             X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
             if (X509_VERIFY_PARAM_set1_host(param, hostname, 0) != 1) {
+                ERR_clear_error();
                 conn->last_error = "Failed to set verification hostname parameter";
                 return POSIX_TLS_ERR_INTERNAL;
             }
@@ -480,6 +584,7 @@ int posix_tls_connect(posix_tls_connection_t* conn, const char* hostname) {
     }
 
     conn->state = POSIX_TLS_STATE_HANDSHAKE;
+    ERR_clear_error();
     int rc = SSL_connect(conn->ssl);
     if (rc <= 0) {
         int ssl_err = SSL_get_error(conn->ssl, rc);
@@ -491,23 +596,18 @@ int posix_tls_connect(posix_tls_connection_t* conn, const char* hostname) {
         }
         conn->state = POSIX_TLS_STATE_FAILED;
         if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+            ERR_clear_error();
             return POSIX_TLS_ERR_CLOSED;
         }
 
         long verify_err = SSL_get_verify_result(conn->ssl);
         if (verify_err != X509_V_OK) {
+            ERR_clear_error();
             conn->last_error = X509_verify_cert_error_string(verify_err);
             return POSIX_TLS_ERR_CERT_VERIFY;
         }
 
-        char err_buf[256];
-        unsigned long e = ERR_get_error();
-        if (e != 0) {
-            ERR_error_string_n(e, err_buf, sizeof(err_buf));
-            conn->last_error = err_buf;
-        } else {
-            conn->last_error = "TLS handshake negotiation failed";
-        }
+        capture_openssl_error(conn->last_error, "TLS handshake negotiation failed");
         return POSIX_TLS_ERR_HANDSHAKE_FAILED;
     }
 
@@ -588,6 +688,14 @@ int posix_tls_accept(posix_tls_connection_t* conn) {
     if (conn->state == POSIX_TLS_STATE_FAILED) {
         return POSIX_TLS_ERR_IO_FAILED;
     }
+    if (conn->state == POSIX_TLS_STATE_CLOSED) {
+        conn->last_error = "Connection is closed";
+        return POSIX_TLS_ERR_CLOSED;
+    }
+    if (conn->state == POSIX_TLS_STATE_AUTHENTICATED) {
+        conn->last_error = "Connection is already authenticated";
+        return POSIX_TLS_ERR_INVALID_ARG;
+    }
 
     if (conn->ctx->policy == POSIX_TLS_POLICY_P2P) {
         // P2P Non-mTLS Server Contract:
@@ -596,6 +704,7 @@ int posix_tls_accept(posix_tls_connection_t* conn) {
     }
 
     conn->state = POSIX_TLS_STATE_HANDSHAKE;
+    ERR_clear_error();
     int rc = SSL_accept(conn->ssl);
     if (rc <= 0) {
         int ssl_err = SSL_get_error(conn->ssl, rc);
@@ -607,17 +716,11 @@ int posix_tls_accept(posix_tls_connection_t* conn) {
         }
         conn->state = POSIX_TLS_STATE_FAILED;
         if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+            ERR_clear_error();
             return POSIX_TLS_ERR_CLOSED;
         }
 
-        char err_buf[256];
-        unsigned long e = ERR_get_error();
-        if (e != 0) {
-            ERR_error_string_n(e, err_buf, sizeof(err_buf));
-            conn->last_error = err_buf;
-        } else {
-            conn->last_error = "TLS server accept handshake failed";
-        }
+        capture_openssl_error(conn->last_error, "TLS server accept handshake failed");
         return POSIX_TLS_ERR_HANDSHAKE_FAILED;
     }
 
@@ -639,6 +742,9 @@ int posix_tls_read(posix_tls_connection_t* conn, void* buf, size_t count, size_t
         return POSIX_TLS_ERR_INVALID_ARG;
     }
     *bytes_read = 0;
+    if (count == 0 || count > static_cast<size_t>(INT_MAX)) {
+        return POSIX_TLS_ERR_INVALID_ARG;
+    }
 
     if (conn->state != POSIX_TLS_STATE_AUTHENTICATED) {
         conn->last_error = (conn->state == POSIX_TLS_STATE_FAILED) ?
@@ -646,6 +752,7 @@ int posix_tls_read(posix_tls_connection_t* conn, void* buf, size_t count, size_t
         return (conn->state == POSIX_TLS_STATE_FAILED) ? POSIX_TLS_ERR_PIN_MISMATCH : POSIX_TLS_ERR_IO_FAILED;
     }
 
+    ERR_clear_error();
     int rc = SSL_read(conn->ssl, buf, static_cast<int>(count));
     if (rc > 0) {
         *bytes_read = static_cast<size_t>(rc);
@@ -660,10 +767,11 @@ int posix_tls_read(posix_tls_connection_t* conn, void* buf, size_t count, size_t
         return POSIX_TLS_ERR_WANT_WRITE;
     }
     if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+        ERR_clear_error();
         return POSIX_TLS_ERR_CLOSED;
     }
 
-    conn->last_error = "SSL_read encountered an underlying I/O error";
+    capture_openssl_error(conn->last_error, "SSL_read encountered an underlying I/O error");
     return POSIX_TLS_ERR_IO_FAILED;
 }
 
@@ -672,6 +780,9 @@ int posix_tls_write(posix_tls_connection_t* conn, const void* buf, size_t count,
         return POSIX_TLS_ERR_INVALID_ARG;
     }
     *bytes_written = 0;
+    if (count == 0 || count > static_cast<size_t>(INT_MAX)) {
+        return POSIX_TLS_ERR_INVALID_ARG;
+    }
 
     if (conn->state != POSIX_TLS_STATE_AUTHENTICATED) {
         conn->last_error = (conn->state == POSIX_TLS_STATE_FAILED) ?
@@ -679,6 +790,7 @@ int posix_tls_write(posix_tls_connection_t* conn, const void* buf, size_t count,
         return (conn->state == POSIX_TLS_STATE_FAILED) ? POSIX_TLS_ERR_PIN_MISMATCH : POSIX_TLS_ERR_IO_FAILED;
     }
 
+    ERR_clear_error();
     int rc = SSL_write(conn->ssl, buf, static_cast<int>(count));
     if (rc > 0) {
         *bytes_written = static_cast<size_t>(rc);
@@ -693,10 +805,11 @@ int posix_tls_write(posix_tls_connection_t* conn, const void* buf, size_t count,
         return POSIX_TLS_ERR_WANT_WRITE;
     }
     if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+        ERR_clear_error();
         return POSIX_TLS_ERR_CLOSED;
     }
 
-    conn->last_error = "SSL_write encountered an underlying I/O error";
+    capture_openssl_error(conn->last_error, "SSL_write encountered an underlying I/O error");
     return POSIX_TLS_ERR_IO_FAILED;
 }
 
@@ -712,6 +825,7 @@ int posix_tls_shutdown(posix_tls_connection_t* conn) {
         return POSIX_TLS_ERR_CLOSED;
     }
 
+    ERR_clear_error();
     int rc = SSL_shutdown(conn->ssl);
     if (rc >= 0) {
         conn->state = POSIX_TLS_STATE_CLOSED;
@@ -727,7 +841,7 @@ int posix_tls_shutdown(posix_tls_connection_t* conn) {
     }
 
     conn->state = POSIX_TLS_STATE_CLOSED;
-    conn->last_error = "SSL_shutdown failed";
+    capture_openssl_error(conn->last_error, "SSL_shutdown failed");
     return POSIX_TLS_ERR_IO_FAILED;
 }
 

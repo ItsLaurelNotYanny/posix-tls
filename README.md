@@ -33,7 +33,7 @@ cmake --install build/host --prefix "$PWD/build/sdk-host"
 ```
 
 - `./check.sh --fast`: Verifies public tree hygiene, pinned SHA-256 digests, and strict C++03 compilation.
-- `./check.sh`: Runs the full gate—16-case TLS contract test suite, fragmented nonblocking bidirectional transfer and active cancellation tests, relocated pure C and C++03 consumer builds with ELF `.dynsym` isolation verification, and a live local TCP TLS 1.3 client/server exchange.
+- `./check.sh`: Runs the full gate—20-case TLS contract and regression suite, fragmented nonblocking bidirectional transfer and active cancellation tests, relocated pure C and C++03 consumer builds with ELF `.dynsym` isolation verification, and live local TCP TLS 1.3 client/server exchanges (pinned P2P and Public PKI fullchain).
 - Set `SOURCE_CACHE_DIR=/path/to/cache` to reuse pre-downloaded archives without network access, and `BUILD_JOBS` to control OpenSSL build parallelism (default `4`).
 
 ---
